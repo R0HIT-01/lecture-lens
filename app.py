@@ -44,6 +44,7 @@ def download_video(url):
     ydl_opts = {
         'format': 'best[ext=mp4]',
         'outtmpl': safe_filename,
+        'cookiefile': 'cookies.txt',
         'quiet': True,
         'overwrites': True
         
