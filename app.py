@@ -1,22 +1,24 @@
 import streamlit as st
 import google.generativeai as genai
+import concurrent.futures
 import yt_dlp
 import cv2
 import time
 import os
-import json
-import re
 from dotenv import load_dotenv
-load_dotenv()  # Load variables from .env
+from PIL import Image
 
+# ================== ENV SETUP ==================
+load_dotenv()
 API_KEY = os.getenv("GEMINI_API_KEY")
 
 if not API_KEY:
-    raise RuntimeError("GEMINI_API_KEY not found. Check your .env file.")
+    raise RuntimeError("GEMINI_API_KEY not found in .env")
 
 genai.configure(api_key=API_KEY)
+model_name = "gemini-2.0-flash"
 
-
+# ================== STREAMLIT CONFIG ==================
 st.set_page_config(
     page_title="Lecture-Lens",
     page_icon="🎓",
@@ -24,157 +26,174 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# --- UTILS: CACHING & PROCESSING ---
+# ================== UTILS ==================
 
 @st.cache_resource(show_spinner=False)
 def download_video(url):
-    """
-    Downloads video. Cached so it only runs once per URL.
-    """
-    # Create a unique filename based on the URL hash to avoid conflicts
-    safe_filename = "current_lecture.mp4"
-    
-    # Clean up previous
-    if os.path.exists(safe_filename):
-        try:
-            os.remove(safe_filename)
-        except:
-            pass # File might be in use, we overwrite anyway
+    # Create a unique filename to avoid locking issues
+    timestamp = int(time.time())
+    filename = f"lecture_{timestamp}.mp4"
+
+    # Clean up old mp4 files (optional, but good for hygiene)
+    for f in os.listdir():
+        if f.startswith("lecture_") and f.endswith(".mp4"):
+            try:
+                os.remove(f)
+            except OSError:
+                pass  # If locked, skip it
 
     ydl_opts = {
-        'format': 'best[ext=mp4]',
-        'outtmpl': safe_filename,
-        'cookiefile': 'cookies.txt',
-        'quiet': True,
-        'overwrites': True
-        
+        "format": "best[height<=480][ext=mp4]",  # faster download
+        "outtmpl": filename,
+        "quiet": True,
+        "overwrites": True
     }
-    
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-        return safe_filename
-    except Exception as e:
-        st.error(f"Download failed: {str(e)}")
-        return None
 
-def extract_json_from_text(text):
-    """
-    Helper to find JSON object inside Gemini's response if it includes extra text.
-    """
-    try:
-        # Try finding the first '[' and last ']'
-        match = re.search(r'\[.*\]', text, re.DOTALL)
-        if match:
-            return json.loads(match.group(0))
-        return json.loads(text) # Try direct parse
-    except:
-        return []
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([url])
 
-def get_frame(video_path, timestamp_str):
-    """Extracts frame at MM:SS"""
-    try:
-        parts = list(map(int, timestamp_str.split(':')))
-        if len(parts) == 2: seconds = parts[0] * 60 + parts[1]
-        elif len(parts) == 3: seconds = parts[0] * 3600 + parts[1] * 60 + parts[2]
-        else: return None
+    return filename
 
-        cap = cv2.VideoCapture(video_path)
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(seconds * fps))
-        ret, frame = cap.read()
+
+def extract_keyframes(
+    video_path,
+    max_frames=9,
+    min_gap_sec=25,
+    diff_threshold=25
+):
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+
+    keyframes = []
+    prev_gray = None
+    last_saved_time = -min_gap_sec
+    frame_idx = 0
+
+    try:
+        while cap.isOpened():
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            time_sec = frame_idx / fps
+
+            if time_sec - last_saved_time < min_gap_sec:
+                frame_idx = int((last_saved_time + min_gap_sec) * fps)
+                continue
+
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            diff_score = 100 if prev_gray is None else cv2.absdiff(prev_gray, gray).mean()
+
+            if diff_score > diff_threshold:
+                keyframes.append({
+                    "timestamp": time.strftime('%M:%S', time.gmtime(time_sec)),
+                    "frame": cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                })
+                prev_gray = gray
+                last_saved_time = time_sec
+
+                if len(keyframes) >= max_frames:
+                    break
+
+            frame_idx += int(fps)
+
+    finally:
         cap.release()
         
-        if ret:
-            return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        return None
-    except:
-        return None
+    return keyframes
 
-# --- MAIN UI ---
+
+def summarize_frame(image, timestamp):
+    prompt = f"""
+    This image is a snapshot from a lecture at timestamp {timestamp}.
+    In 1–2 sentences, describe:
+    - What topic is being discussed
+    - What is visually shown (slides, board, code, diagram)
+    """
+
+    # 🔥 CONVERT numpy array → PIL Image
+    pil_image = Image.fromarray(image)
+    
+    # Convert PIL Image to bytes
+    import io
+    img_byte_arr = io.BytesIO()
+    pil_image.save(img_byte_arr, format='JPEG')
+    img_bytes = img_byte_arr.getvalue()
+
+    model = genai.GenerativeModel(model_name)
+    response = model.generate_content([
+        prompt,
+        {"mime_type": "image/jpeg", "data": img_bytes}
+    ])
+    return response.text.strip()
+
+
+# ================== UI ==================
 
 st.title("🎓 Lecture-Lens")
-st.markdown("""
-<style>
-    .big-font { font-size:20px !important; font-weight: 500; }
-    .stButton>button { width: 100%; border-radius: 10px; }
-</style>
-""", unsafe_allow_html=True)
+st.caption("AI-powered visual lecture breakdown")
 
-# Sidebar for controls
 with st.sidebar:
     st.header("Input")
     url = st.text_input("YouTube URL", placeholder="https://youtu.be/...")
-    process_btn = st.button("Analyze Video", type="primary")
-    st.info("💡 Tip: Try math, physics, or coding tutorials.")
+    analyze_btn = st.button("Analyze Video", type="primary")
+    st.info("Works best for lectures, tutorials, and classes")
 
-# Session State to hold results
-if 'analysis' not in st.session_state:
+# ================== SESSION STATE ==================
+
+if "analysis" not in st.session_state:
     st.session_state.analysis = None
-if 'video_file' not in st.session_state:
-    st.session_state.video_file = None
 
-if process_btn and url:
-    # 1. Download
-    with st.status("⬇️ Downloading Video...", expanded=True) as status:
+# ================== MAIN PIPELINE ==================
+
+if analyze_btn and url:
+    with st.status("Processing lecture...", expanded=True) as status:
+
+        status.write("⬇️ Downloading video")
         video_path = download_video(url)
-        st.session_state.video_file = video_path
-        status.write("✅ Download Complete.")
-        
-        # 2. Upload to Gemini
-        status.write("☁️ Uploading to AI Vision Model...")
-        myfile = genai.upload_file(video_path)
-        
-        while myfile.state.name == "PROCESSING":
-            time.sleep(1)
-            myfile = genai.get_file(myfile.name)
-        status.write("✅ AI Processing Ready.")
+        status.write("✅ Download complete")
 
-        # 3. Analyze
-        status.write("🧠 Extracting Visual Knowledge Graph...")
-        model = genai.GenerativeModel("gemini-3-flash-preview")
-        
-        prompt = """
-        You are an expert visual note-taker. Analyze this video timeline.
-        Identify distinct chapters where the visual content (slides, whiteboard, code) changes significantly.
-        
-        Return a valid JSON list. Each object must have:
-        - "timestamp": (MM:SS) The start time of the topic.
-        - "topic": (Title Case) A short title.
-        - "summary": (Sentence) What exactly is shown on the screen?
-        """
-        
-        response = model.generate_content(
-            [myfile, prompt], 
-            generation_config={"response_mime_type": "application/json"}
-        )
-        
-        # 4. Parse & Store
-        data = extract_json_from_text(response.text)
-        st.session_state.analysis = data
-        status.update(label="✅ Analysis Complete!", state="complete", expanded=False)
+        status.write("🎞️ Detecting key scenes")
+        keyframes = extract_keyframes(video_path)
+        status.write(f"✅ {len(keyframes)} scenes detected")
 
-# --- RESULTS DASHBOARD ---
-if st.session_state.analysis and st.session_state.video_file:
-    st.divider()
-    
-    # Iterate through the analysis
+        status.write("🧠 Generating AI summaries")
+        
+        def process_frame(kf):
+            summary = summarize_frame(kf["frame"], kf["timestamp"])
+            return {
+                "timestamp": kf["timestamp"],
+                "frame": kf["frame"],
+                "summary": summary
+            }
+
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            summaries = list(executor.map(process_frame, keyframes))
+
+        st.session_state.analysis = summaries
+        status.update(label="✅ Analysis Complete", state="complete")
+
+# ================== RESULTS ==================
+
+if st.session_state.analysis:
+    st.subheader("📌 Lecture Breakdown")
+
     for item in st.session_state.analysis:
-        col_img, col_text = st.columns([1, 1.5])
-        
+        col_img, col_text = st.columns([1, 3])
+
         with col_img:
-            # Show screenshot
-            img = get_frame(st.session_state.video_file, item['timestamp'])
-            if img is not None:
-                st.image(img, use_container_width=True, caption=f"Snapshot at {item['timestamp']}")
-            else:
-                st.video(st.session_state.video_file) # Fallback
-        
+            st.image(
+                item["frame"],
+                width=220,
+                caption=item["timestamp"]
+            )
+
         with col_text:
-            st.markdown(f"### {item['topic']}")
-            st.caption(f"⏱️ Timestamp: {item['timestamp']}")
-            st.write(item['summary'])
-            st.markdown("---")
+            st.markdown(f"**⏱ {item['timestamp']}**")
+            st.write(item["summary"])
+
+        st.divider()
 
 elif not url:
-    st.write("👈 Paste a URL on the left to start.")
+    st.write("👈 Paste a YouTube lecture link to begin")
